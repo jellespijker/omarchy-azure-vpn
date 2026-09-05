@@ -92,6 +92,27 @@ This will:
 
 ---
 
+## Release & Versioning
+
+Omarchy plugins track the default branch (`main`) directly when installed via `omarchy plugin add` or updated via `omarchy plugin update`. Official versions are tagged and published through GitHub Releases:
+
+1. Update the version in `manifest.json` following Semantic Versioning (`X.Y.Z`).
+2. Run validation locally:
+   ```bash
+   bash .github/scripts/validate-plugin.sh
+   # or
+   omarchy plugin validate .
+   ```
+3. Commit and push the changes to `main`.
+4. Tag and push the new version:
+   ```bash
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+5. The GitHub Actions release workflow automatically verifies manifest parity, packages distribution archives with SHA256 checksums, and publishes the GitHub Release notes.
+
+---
+
 ## Uninstallation / Teardown
 
 To cleanly remove the systemd user service and the sudoers file:
