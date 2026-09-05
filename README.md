@@ -102,6 +102,18 @@ omarchy plugin remove jellespijker.azure-vpn
 
 ---
 
+## Legal, Trademarks & Architecture Notice
+
+- **Independent Community Project**: This project is an independent open-source contribution and is not affiliated with, endorsed by, sponsored by, or associated with Microsoft Corporation in any way.
+- **Trademarks**: "Microsoft", "Azure", "Microsoft Entra ID", and related marks are trademarks of Microsoft Corporation. They are used here solely for descriptive and compatibility identification purposes.
+- **No Proprietary Software**: This repository does not contain, vendor, or distribute any proprietary binaries, source code, or assets from Microsoft's official `microsoft-azurevpnclient` application (which is governed by Microsoft's proprietary EULA).
+- **Backend Components & Licensing**:
+  - This Omarchy plugin (`jellespijker.azure-vpn`) and its Python CLI orchestrator are original works licensed under the [MIT License](LICENSE).
+  - The underlying VPN connection engine relies on [`openp2s`](https://github.com/wyruweso/openp2s) and [OpenVPN](https://openvpn.net/), both open-source projects licensed under the **GNU General Public License v2 (GPL-2.0)**.
+  - The plugin communicates with `openp2s` exclusively across standard process boundaries via command-line invocations and standard I/O pipes. No third-party binaries are vendored into this repository.
+
+---
+
 ## License
 
 MIT © Jelle Spijker
