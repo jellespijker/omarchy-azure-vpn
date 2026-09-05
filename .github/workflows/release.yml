@@ -60,7 +60,10 @@ jobs:
           TAR_NAME="omarchy-azure-vpn-${{ steps.version.outputs.tag }}.tar.gz"
           tar --exclude='./.git*' \
               --exclude='./.github*' \
-              -czf "$TAR_NAME" .
+              --exclude="*.tar.gz" \
+              --exclude="*.sha256" \
+              -czf "/tmp/$TAR_NAME" .
+          mv "/tmp/$TAR_NAME" .
           echo "Created $TAR_NAME"
           sha256sum "$TAR_NAME" > "${TAR_NAME}.sha256"
 
