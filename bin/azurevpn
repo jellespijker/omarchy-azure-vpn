@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import json
+import subprocess
+import time
+import shutil
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "azure-vpn"
+PROFILES_DIR = CONFIG_DIR / "profiles"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
+SERVICE_FILE = SYSTEMD_USER_DIR / "azure-vpn.service"
+
+def ensure_systemd_service():
+    SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+    bin_path = shutil.which("azurevpn") or str(Path.home() / ".local" / "bin" / "azurevpn")
+    service_content = f"""[Unit]
+Description=Azure VPN Client Background Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={bin_path} daemon
+ExecStop=/usr/local/bin/openp2s disconnect
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target
+"""
+    if not SERVICE_FILE.exists() or SERVICE_FILE.read_text(encoding="utf-8") != service_content:
+        SERVICE_FILE.write_text(service_content, encoding="utf-8")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, check=False)
+
+def ensure_dirs():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILES_DIR.chmod(0o700)
+    
+    # State dir for openp2s
+    state_dir = Path.home() / ".local" / "state" / "openp2s"
+    if state_dir.exists():
+        try:
+            state_dir.chmod(0o700)
+        except Exception:
+            pass
+
+    if not CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"active_profile": "", "dns_all": False}, f, indent=2)
+    CONFIG_FILE.chmod(0o600)
+    for p in PROFILES_DIR.glob("*.xml"):
+        p.chmod(0o600)
+
+    ensure_systemd_service()
+    
+    # Auto-seed initial profile if empty
+    profiles = list_profiles()
+    if not profiles:
+        seed_profile()
+
+def load_config():
+    ensure_dirs()
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"active_profile": "", "dns_all": False}
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    CONFIG_FILE.chmod(0o600)
+
+def list_profiles():
+    if not PROFILES_DIR.exists():
+        return []
+    return sorted([p.stem for p in PROFILES_DIR.glob("*.xml")])
+
+def seed_profile():
+    candidates = [
+        Path.home() / "Downloads" / "azurevpnconfig_aad.xml",
+        Path.home() / ".config" / "microsoft-azurevpnclient" / "profiles" / "UM-AzureCloud"
+    ]
+    for c in candidates:
+        if c.exists():
+            import_file(str(c), notify=False)
+            break
+
+def normalize_profile_xml(xml_content):
+    xml_content = re.sub(r'<\s*DnsServerEntry\s*>', '', xml_content)
+    xml_content = re.sub(r'<\s*/\s*DnsServerEntry\s*>', '', xml_content)
+    return xml_content
+
+def extract_profile_name(xml_content, fallback="AzureVPN"):
+    m = re.search(r'<\s*name\s*>([^<]+)<\s*/\s*name\s*>', xml_content)
+    raw = m.group(1).strip() if m else fallback
+    # Security hardening: sanitize against path traversal and special characters
+    sanitized = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', raw).strip('._')
+    return sanitized[:64] if sanitized else fallback
+
+def import_file(file_path, notify=True):
+    p = Path(file_path)
+    if not p.is_file():
+        print(f"Error: File not found: {file_path}", file=sys.stderr)
+        return False
+
+    try:
+        content = p.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error reading file: {e}", file=sys.stderr)
+        return False
+
+    name = extract_profile_name(content, fallback=p.stem)
+    normalized = normalize_profile_xml(content)
+    
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = PROFILES_DIR / f"{name}.xml"
+    dest.write_text(normalized, encoding="utf-8")
+    dest.chmod(0o600)
+    
+    cfg = load_config()
+    cfg["active_profile"] = name
+    save_config(cfg)
+    
+    print(f"✓ Imported profile '{name}' successfully.")
+    if notify:
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Profile Imported", f"Profile '{name}' is ready to connect."], check=False)
+    return True
+
+def import_dialog():
+    try:
+        res = subprocess.run(
+            ["zenity", "--file-selection", "--title=Select Azure VPN Profile XML", "--file-filter=XML Profiles (*.xml) | *.xml", "--file-filter=All Files | *"],
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            filepath = res.stdout.strip()
+            return 0 if import_file(filepath, notify=True) else 1
+    except Exception as e:
+        print(f"Dialog error: {e}", file=sys.stderr)
+    return 1
+
+def get_status_data():
+    ensure_dirs()
+    cfg = load_config()
+    profiles = list_profiles()
+    active_profile = cfg.get("active_profile", "")
+    if not active_profile and profiles:
+        active_profile = profiles[0]
+        cfg["active_profile"] = active_profile
+        save_config(cfg)
+
+    # Query openp2s status
+    try:
+        res = subprocess.run(["openp2s", "status", "--json"], capture_output=True, text=True)
+        data = json.loads(res.stdout) if res.stdout.strip() else {}
+    except Exception:
+        data = {}
+
+    # Check systemd user service state
+    svc_active = False
+    try:
+        s_res = subprocess.run(["systemctl", "--user", "is-active", "azure-vpn"], capture_output=True, text=True)
+        svc_active = (s_res.stdout.strip() == "active")
+    except Exception:
+        pass
+
+    connected = data.get("connected", False)
+    state = "connected" if connected else ("connecting" if svc_active else "disconnected")
+
+    result = {
+        "connected": connected,
+        "state": state,
+        "profile": data.get("profile") or active_profile,
+        "active_profile": active_profile,
+        "available_profiles": profiles,
+        "address": data.get("address", ""),
+        "interface": data.get("interface", ""),
+        "gateway": data.get("gateway", ""),
+        "account": data.get("account", ""),
+        "uptimeSeconds": data.get("uptimeSeconds", 0),
+        "dnsServers": data.get("dnsServers", [])
+    }
+    return result
+
+def cmd_status(as_json=False):
+    data = get_status_data()
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+
+    if data["connected"]:
+        print(f"Azure VPN: Connected ({data['profile']})")
+        print(f"  Interface: {data['interface']}")
+        print(f"  IP:        {data['address']}")
+        print(f"  Account:   {data['account']}")
+        print(f"  Gateway:   {data['gateway']}")
+        print(f"  Uptime:    {data['uptimeSeconds']}s")
+    elif data["state"] == "connecting":
+        print(f"Azure VPN: Connecting to {data['active_profile']}...")
+    else:
+        print(f"Azure VPN: Disconnected (Active profile: {data['active_profile'] or 'None'})")
+
+def cmd_connect(profile_name=None):
+    cfg = load_config()
+    if profile_name:
+        if profile_name not in list_profiles():
+            if Path(profile_name).is_file():
+                import_file(profile_name)
+                cfg = load_config()
+            else:
+                print(f"Profile '{profile_name}' not found. Available: {', '.join(list_profiles())}", file=sys.stderr)
+                return 1
+        else:
+            cfg["active_profile"] = profile_name
+            save_config(cfg)
+
+    active_profile = cfg.get("active_profile")
+    if not active_profile:
+        print("No active profile selected. Run 'azurevpn import <file.xml>' first.", file=sys.stderr)
+        return 1
+
+    profile_path = PROFILES_DIR / f"{active_profile}.xml"
+    if not profile_path.exists():
+        print(f"Profile file missing: {profile_path}", file=sys.stderr)
+        return 1
+
+    if not shutil.which("openp2s") or not Path("/usr/local/lib/openp2s/openvpn").exists():
+        print("Error: 'openp2s' or its patched openvpn binary is not installed.", file=sys.stderr)
+        print("Run 'azurevpn setup' to automatically install prerequisites and configure permissions.", file=sys.stderr)
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Missing Dependency", "openp2s is required. Run 'azurevpn setup' in terminal."], check=False)
+        return 1
+
+    status = get_status_data()
+    if status["connected"]:
+        print(f"Already connected to {status['profile']} ({status['address']}).")
+        return 0
+
+    auth_res = subprocess.run(["openp2s", "auth", "status"], capture_output=True, text=True)
+    if "No cached Entra sessions" in auth_res.stdout or auth_res.returncode != 0:
+        print(f"Initiating authentication for {active_profile}...")
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Authenticating", "Please complete sign-in in your browser."], check=False)
+        login_res = subprocess.run(["openp2s", "auth", "login", str(profile_path)])
+        if login_res.returncode != 0:
+            print("Authentication failed or cancelled.", file=sys.stderr)
+            return 1
+
+    print(f"Connecting to {active_profile}...")
+    subprocess.run(["systemctl", "--user", "start", "azure-vpn"], check=False)
+
+    for _ in range(24):
+        time.sleep(0.5)
+        st = get_status_data()
+        if st["connected"]:
+            print(f"✓ Connected to {active_profile} ({st['address']}) on {st['interface']}.")
+            subprocess.run(["notify-send", "-a", "Azure VPN", "VPN Connected", f"Connected to {active_profile}\nIP: {st['address']}"], check=False)
+            return 0
+
+    print("Connection started in background (check status with 'azurevpn status').")
+    return 0
+
+def cmd_setup():
+    print("=== Azure VPN Plugin Setup & Hardening ===")
+    has_openp2s = bool(shutil.which("openp2s")) and Path("/usr/local/lib/openp2s/openvpn").exists()
+    
+    if has_openp2s:
+        print("✓ openp2s and patched openvpn binaries found.")
+    else:
+        print("Installing openp2s v0.2.0 from GitHub releases...")
+        tar_url = "https://github.com/wyruweso/openp2s/releases/download/v0.2.0/openp2s-0.2.0-linux-amd64.tar.gz"
+        tmp_tar = Path("/tmp/openp2s.tar.gz")
+        subprocess.run(["curl", "-fsSL", tar_url, "-o", str(tmp_tar)], check=True)
+        subprocess.run(["sudo", "tar", "-xzf", str(tmp_tar), "-C", "/usr/local", "--strip-components=1"], check=True)
+        if tmp_tar.exists():
+            tmp_tar.unlink()
+        print("✓ openp2s installed to /usr/local/bin/openp2s")
+
+    # Hardening: Sudoers rule
+    sudoers_path = Path("/etc/sudoers.d/99-openp2s")
+    if not sudoers_path.exists():
+        print("Setting up scoped sudoers rule for OpenVPN (/etc/sudoers.d/99-openp2s)...")
+        rule = "ALL ALL=(ALL) NOPASSWD: /usr/local/lib/openp2s/openvpn\n"
+        p = subprocess.Popen(["sudo", "tee", str(sudoers_path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        p.communicate(rule.encode())
+        subprocess.run(["sudo", "chmod", "0440", str(sudoers_path)], check=True)
+        print("✓ Sudoers rule created.")
+    else:
+        print("✓ Sudoers rule already exists.")
+
+    # Hardening: File permissions
+    ensure_dirs()
+    print("✓ Secured configuration directory permissions (0700).")
+    
+    print("\n✓ Setup complete! You can now import profiles and connect seamlessly.")
+    return 0
+
+def cmd_disconnect():
+    print("Disconnecting Azure VPN...")
+    subprocess.run(["systemctl", "--user", "stop", "azure-vpn"], check=False)
+    subprocess.run(["openp2s", "disconnect"], capture_output=True, check=False)
+    subprocess.run(["notify-send", "-a", "Azure VPN", "VPN Disconnected", "Disconnected from Azure VPN."], check=False)
+    print("✓ Disconnected.")
+    return 0
+
+def cmd_daemon():
+    cfg = load_config()
+    active_profile = cfg.get("active_profile")
+    if not active_profile:
+        print("Error: No active profile configured", file=sys.stderr)
+        sys.exit(1)
+    profile_path = PROFILES_DIR / f"{active_profile}.xml"
+    if not profile_path.exists():
+        print(f"Error: Profile file not found: {profile_path}", file=sys.stderr)
+        sys.exit(1)
+
+    args = ["openp2s", "connect", str(profile_path), "--allow-system-trust-store"]
+    if cfg.get("dns_all", False):
+        args.append("--dns-all")
+    os.execvp("openp2s", args)
+
+def main():
+    ensure_dirs()
+    args = sys.argv[1:]
+    if not args:
+        cmd_status(as_json=False)
+        return
+
+    cmd = args[0].lower()
+    if cmd in ("status", "st"):
+        as_json = "--json" in args or "-j" in args
+        cmd_status(as_json=as_json)
+    elif cmd in ("connect", "up", "c"):
+        prof = args[1] if len(args) > 1 and not args[1].startswith("-") else None
+        sys.exit(cmd_connect(prof))
+    elif cmd in ("disconnect", "down", "d"):
+        sys.exit(cmd_disconnect())
+    elif cmd in ("toggle", "t"):
+        st = get_status_data()
+        if st["connected"] or st["state"] == "connecting":
+            sys.exit(cmd_disconnect())
+        else:
+            sys.exit(cmd_connect())
+    elif cmd in ("list", "ls"):
+        profiles = list_profiles()
+        cfg = load_config()
+        active = cfg.get("active_profile", "")
+        if "--json" in args:
+            print(json.dumps(profiles))
+        else:
+            print("Available profiles:")
+            for p in profiles:
+                mark = "*" if p == active else " "
+                print(f"  {mark} {p}")
+    elif cmd in ("select", "use"):
+        if len(args) < 2:
+            print("Usage: azurevpn select <profile_name>", file=sys.stderr)
+            sys.exit(1)
+        name = args[1]
+        if name not in list_profiles():
+            print(f"Profile '{name}' not found.", file=sys.stderr)
+            sys.exit(1)
+        cfg = load_config()
+        cfg["active_profile"] = name
+        save_config(cfg)
+        print(f"Selected profile: {name}")
+    elif cmd in ("import", "add"):
+        if len(args) < 2:
+            sys.exit(import_dialog())
+        else:
+            ok = import_file(args[1], notify=True)
+            sys.exit(0 if ok else 1)
+    elif cmd == "import-dialog":
+        sys.exit(import_dialog())
+    elif cmd in ("setup", "install-deps"):
+        sys.exit(cmd_setup())
+    elif cmd == "daemon":
+        cmd_daemon()
+    else:
+        print("Usage: azurevpn [connect [profile] | disconnect | status [--json] | list | select <profile> | import [file.xml] | setup]")
+
+if __name__ == "__main__":
+    main()
