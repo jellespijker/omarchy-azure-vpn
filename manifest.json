@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "azure-vpn",
+  "id": "jellespijker.azure-vpn",
   "name": "Azure VPN",
   "version": "1.0.0",
   "author": "Jelle Spijker",

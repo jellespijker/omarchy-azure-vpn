@@ -8,10 +8,10 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "azure-vpn"
-  ipcTarget: "azure-vpn"
+  moduleName: "jellespijker.azure-vpn"
+  ipcTarget: "jellespijker.azure-vpn"
 
-  readonly property string script: Quickshell.env("HOME") + "/.local/bin/azurevpn"
+  readonly property string script: Qt.resolvedUrl("bin/azurevpn").toString().replace(/^file:\/\//, "")
 
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -34,10 +34,23 @@ Panel {
   property string gateway: ""
   property string account: ""
   property int uptimeSeconds: 0
-  property string profile: "UM-AzureCloud"
-  property string activeProfile: "UM-AzureCloud"
+  property string profile: ""
+  property string activeProfile: ""
   property var availableProfiles: []
   property bool busy: false
+  property string lastError: ""
+
+  Timer {
+    id: statusWatchdog
+    interval: 8000
+    repeat: false
+    onTriggered: {
+      if (statusProc.running) {
+        statusProc.running = false
+        root.busy = false
+      }
+    }
+  }
 
   // Icons
   readonly property string iconVpn: "󰦝"
@@ -51,6 +64,7 @@ Panel {
   readonly property string iconClock: "󱎫"
 
   function applyStatus(raw) {
+    statusWatchdog.stop()
     busy = false
     if (!raw || raw.trim() === "") return
     try {
@@ -62,10 +76,12 @@ Panel {
       root.gateway = data.gateway || ""
       root.account = data.account || ""
       root.uptimeSeconds = data.uptimeSeconds || 0
-      root.profile = data.profile || data.active_profile || "Azure VPN"
+      root.profile = data.profile || data.active_profile || ""
       root.activeProfile = data.active_profile || root.profile
       root.availableProfiles = data.available_profiles || []
+      root.lastError = ""
     } catch (e) {
+      root.lastError = "Failed to parse VPN status"
       console.warn("Failed to parse Azure VPN status:", e, raw)
     }
   }
@@ -82,6 +98,7 @@ Panel {
 
   function refresh() {
     if (statusProc.running) return
+    statusWatchdog.restart()
     statusProc.command = [root.script, "status", "--json"]
     statusProc.running = true
   }
@@ -151,9 +168,9 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // Polling timer: fast when popup is open or connecting, periodic when closed
+  // Polling timer: adaptive interval
   Timer {
-    interval: root.opened ? 2000 : (root.status === "connecting" ? 1500 : 5000)
+    interval: root.opened ? 2000 : (root.status === "connecting" ? 1500 : (root.connected ? 10000 : 30000))
     running: true
     repeat: true
     triggeredOnStart: true
@@ -211,6 +228,7 @@ Panel {
         contentHeight: mainColumn.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
 
         Column {
           id: mainColumn
@@ -221,8 +239,8 @@ Panel {
           PanelHero {
             width: parent.width
             title: "Azure VPN"
-            meta: root.connected ? "Connected" : (root.status === "connecting" ? "Connecting..." : "Disconnected")
-            detail: root.profile
+            meta: root.connected ? "Connected" : (root.status === "connecting" ? "Connecting..." : (root.status === "failed" ? "Failed" : "Disconnected"))
+            detail: root.profile || (root.activeProfile ? root.activeProfile : "No profile selected")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconOpacity: root.connected ? 1.0 : 0.6
@@ -231,7 +249,7 @@ Panel {
                 text: root.iconVpn
                 font.family: root.fontFamily
                 font.pixelSize: Style.space(22)
-                color: root.connected ? root.accent : root.dim
+                color: root.connected ? root.accent : (root.status === "failed" ? root.urgent : root.dim)
               }
             }
             trailingControl: Component {
@@ -283,7 +301,8 @@ Panel {
                 model: root.availableProfiles
                 delegate: Rectangle {
                   id: profileRow
-                  width: mainColumn.width
+                  required property string modelData
+                  width: parent.width
                   height: Style.space(36)
                   radius: Style.space(6)
                   color: (modelData === root.activeProfile) 
@@ -489,9 +508,31 @@ Panel {
             }
           }
 
+          // Failed description
+          Text {
+            visible: root.status === "failed"
+            width: parent.width
+            text: "VPN connection failed. Run: journalctl --user -u azure-vpn"
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          // Error banner
+          Text {
+            visible: root.lastError !== ""
+            width: parent.width
+            text: root.lastError
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
           // Disconnected description
           Text {
-            visible: !root.connected && root.status !== "connecting"
+            visible: !root.connected && root.status !== "connecting" && root.status !== "failed"
             width: parent.width
             text: "Connect to Azure VPN directly in the background without any GUI client."
             color: root.dim
@@ -521,7 +562,7 @@ Panel {
             width: parent.width
             text: root.connected 
               ? "Disconnect" 
-              : (root.status === "connecting" ? "Connecting..." : ("Connect to " + root.activeProfile))
+              : (root.status === "connecting" ? "Connecting..." : (root.activeProfile ? ("Connect to " + root.activeProfile) : "Connect"))
             iconText: root.iconPower
             fontFamily: root.fontFamily
             foreground: root.connected ? root.urgent : root.foreground

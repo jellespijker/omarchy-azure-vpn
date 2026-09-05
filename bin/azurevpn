@@ -6,8 +6,17 @@ import json
 import subprocess
 import time
 import shutil
+import getpass
+import tempfile
+import hashlib
+import platform
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
+OPENP2S_VERSION = "0.2.0"
+OPENP2S_SHA256 = "dcdd4777c96c4e40594af1d9416e3f858d4045eadc2db7f2a550d216cecac7b6"
+
+SELF_PATH = str(Path(__file__).resolve())
 CONFIG_DIR = Path.home() / ".config" / "azure-vpn"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -16,7 +25,7 @@ SERVICE_FILE = SYSTEMD_USER_DIR / "azure-vpn.service"
 
 def ensure_systemd_service():
     SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
-    bin_path = shutil.which("azurevpn") or str(Path.home() / ".local" / "bin" / "azurevpn")
+    openp2s_bin = shutil.which("openp2s") or "/usr/local/bin/openp2s"
     service_content = f"""[Unit]
 Description=Azure VPN Client Background Service
 After=network-online.target
@@ -24,10 +33,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={bin_path} daemon
-ExecStop=/usr/local/bin/openp2s disconnect
+ExecStart={SELF_PATH} daemon
+ExecStop={openp2s_bin} disconnect
 Restart=on-failure
 RestartSec=3s
+StartLimitIntervalSec=30s
+StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
@@ -42,27 +53,27 @@ def ensure_dirs():
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     PROFILES_DIR.chmod(0o700)
     
-    # State dir for openp2s
     state_dir = Path.home() / ".local" / "state" / "openp2s"
     if state_dir.exists():
         try:
             state_dir.chmod(0o700)
-        except Exception:
-            pass
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not chmod state dir: {e}\n")
 
     if not CONFIG_FILE.exists():
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"active_profile": "", "dns_all": False}, f, indent=2)
+            json.dump({
+                "active_profile": "",
+                "dns_all": False,
+                "allow_system_trust_store": False
+            }, f, indent=2)
     CONFIG_FILE.chmod(0o600)
-    for p in PROFILES_DIR.glob("*.xml"):
-        p.chmod(0o600)
 
-    ensure_systemd_service()
-    
-    # Auto-seed initial profile if empty
-    profiles = list_profiles()
-    if not profiles:
-        seed_profile()
+    for p in PROFILES_DIR.glob("*.xml"):
+        try:
+            p.chmod(0o600)
+        except Exception:
+            pass
 
 def load_config():
     ensure_dirs()
@@ -70,7 +81,7 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {"active_profile": "", "dns_all": False}
+        return {"active_profile": "", "dns_all": False, "allow_system_trust_store": False}
 
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,26 +94,24 @@ def list_profiles():
         return []
     return sorted([p.stem for p in PROFILES_DIR.glob("*.xml")])
 
-def seed_profile():
-    candidates = [
-        Path.home() / "Downloads" / "azurevpnconfig_aad.xml",
-        Path.home() / ".config" / "microsoft-azurevpnclient" / "profiles" / "UM-AzureCloud"
-    ]
-    for c in candidates:
-        if c.exists():
-            import_file(str(c), notify=False)
-            break
-
 def normalize_profile_xml(xml_content):
     xml_content = re.sub(r'<\s*DnsServerEntry\s*>', '', xml_content)
     xml_content = re.sub(r'<\s*/\s*DnsServerEntry\s*>', '', xml_content)
     return xml_content
 
-def extract_profile_name(xml_content, fallback="AzureVPN"):
-    m = re.search(r'<\s*name\s*>([^<]+)<\s*/\s*name\s*>', xml_content)
-    raw = m.group(1).strip() if m else fallback
-    # Security hardening: sanitize against path traversal and special characters
-    sanitized = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', raw).strip('._')
+def parse_and_validate_profile(content, fallback="AzureVPN"):
+    try:
+        root_el = ET.fromstring(content)
+    except ET.ParseError as e:
+        raise ValueError(f"Invalid XML syntax: {e}")
+
+    name_el = root_el.find(".//name")
+    if name_el is None or not name_el.text:
+        raw_name = fallback
+    else:
+        raw_name = name_el.text.strip()
+
+    sanitized = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', raw_name).strip('._')
     return sanitized[:64] if sanitized else fallback
 
 def import_file(file_path, notify=True):
@@ -117,33 +126,56 @@ def import_file(file_path, notify=True):
         print(f"Error reading file: {e}", file=sys.stderr)
         return False
 
-    name = extract_profile_name(content, fallback=p.stem)
+    try:
+        name = parse_and_validate_profile(content, fallback=p.stem)
+    except ValueError as e:
+        print(f"Error: not a valid Azure VPN profile XML: {e}", file=sys.stderr)
+        if notify:
+            subprocess.run(["notify-send", "-a", "Azure VPN", "Import Failed", f"Invalid XML: {e}"], check=False)
+        return False
+
     normalized = normalize_profile_xml(content)
-    
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    
     dest = PROFILES_DIR / f"{name}.xml"
+    if dest.exists() and dest.read_text(encoding="utf-8") != normalized:
+        suffix = 1
+        while (PROFILES_DIR / f"{name}_{suffix}.xml").exists():
+            suffix += 1
+        name = f"{name}_{suffix}"
+        dest = PROFILES_DIR / f"{name}.xml"
+
     dest.write_text(normalized, encoding="utf-8")
     dest.chmod(0o600)
     
     cfg = load_config()
     cfg["active_profile"] = name
     save_config(cfg)
-    
-    print(f"✓ Imported profile '{name}' successfully.")
+
+    print(f"✓ Imported profile '{name}' ({dest})")
     if notify:
-        subprocess.run(["notify-send", "-a", "Azure VPN", "Profile Imported", f"Profile '{name}' is ready to connect."], check=False)
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Profile Imported", f"Imported '{name}' as active profile."], check=False)
     return True
 
 def import_dialog():
+    if not shutil.which("zenity"):
+        print("Error: 'zenity' is required for the file chooser dialog.", file=sys.stderr)
+        print("You can import via CLI: azurevpn import <path-to-file.xml>", file=sys.stderr)
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Zenity Missing", "Please run: azurevpn import <path.xml>"], check=False)
+        return 1
+
     try:
-        res = subprocess.run(
-            ["zenity", "--file-selection", "--title=Select Azure VPN Profile XML", "--file-filter=XML Profiles (*.xml) | *.xml", "--file-filter=All Files | *"],
-            capture_output=True,
-            text=True
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            filepath = res.stdout.strip()
-            return 0 if import_file(filepath, notify=True) else 1
+        res = subprocess.run([
+            "zenity", "--file-selection",
+            "--title=Select Azure VPN Profile XML",
+            "--file-filter=VPN Profiles (*.xml) | *.xml",
+            "--file-filter=All Files | *"
+        ], capture_output=True, text=True, timeout=120)
+        
+        path = res.stdout.strip()
+        if path and res.returncode == 0:
+            ok = import_file(path, notify=True)
+            return 0 if ok else 1
     except Exception as e:
         print(f"Dialog error: {e}", file=sys.stderr)
     return 1
@@ -158,25 +190,36 @@ def get_status_data():
         cfg["active_profile"] = active_profile
         save_config(cfg)
 
-    # Query openp2s status
-    try:
-        res = subprocess.run(["openp2s", "status", "--json"], capture_output=True, text=True)
-        data = json.loads(res.stdout) if res.stdout.strip() else {}
-    except Exception:
-        data = {}
+    data = {}
+    if shutil.which("openp2s"):
+        try:
+            res = subprocess.run(["openp2s", "status", "--json"], capture_output=True, text=True, timeout=5)
+            if res.stdout.strip():
+                data = json.loads(res.stdout)
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            data = {}
 
-    # Check systemd user service state
     svc_active = False
+    svc_failed = False
     try:
-        s_res = subprocess.run(["systemctl", "--user", "is-active", "azure-vpn"], capture_output=True, text=True)
+        s_res = subprocess.run(["systemctl", "--user", "is-active", "azure-vpn"], capture_output=True, text=True, timeout=3)
         svc_active = (s_res.stdout.strip() == "active")
-    except Exception:
+        f_res = subprocess.run(["systemctl", "--user", "is-failed", "azure-vpn"], capture_output=True, text=True, timeout=3)
+        svc_failed = (f_res.stdout.strip() == "failed")
+    except (subprocess.TimeoutExpired, OSError):
         pass
 
     connected = data.get("connected", False)
-    state = "connected" if connected else ("connecting" if svc_active else "disconnected")
+    if connected:
+        state = "connected"
+    elif svc_failed:
+        state = "failed"
+    elif svc_active:
+        state = "connecting"
+    else:
+        state = "disconnected"
 
-    result = {
+    return {
         "connected": connected,
         "state": state,
         "profile": data.get("profile") or active_profile,
@@ -189,7 +232,6 @@ def get_status_data():
         "uptimeSeconds": data.get("uptimeSeconds", 0),
         "dnsServers": data.get("dnsServers", [])
     }
-    return result
 
 def cmd_status(as_json=False):
     data = get_status_data()
@@ -206,6 +248,8 @@ def cmd_status(as_json=False):
         print(f"  Uptime:    {data['uptimeSeconds']}s")
     elif data["state"] == "connecting":
         print(f"Azure VPN: Connecting to {data['active_profile']}...")
+    elif data["state"] == "failed":
+        print(f"Azure VPN: Failed to connect to {data['active_profile']}. Check journalctl --user -u azure-vpn")
     else:
         print(f"Azure VPN: Disconnected (Active profile: {data['active_profile'] or 'None'})")
 
@@ -233,27 +277,40 @@ def cmd_connect(profile_name=None):
         print(f"Profile file missing: {profile_path}", file=sys.stderr)
         return 1
 
-    if not shutil.which("openp2s") or not Path("/usr/local/lib/openp2s/openvpn").exists():
+    openp2s_bin = shutil.which("openp2s")
+    if not openp2s_bin or not Path("/usr/local/lib/openp2s/openvpn").exists():
         print("Error: 'openp2s' or its patched openvpn binary is not installed.", file=sys.stderr)
         print("Run 'azurevpn setup' to automatically install prerequisites and configure permissions.", file=sys.stderr)
-        subprocess.run(["notify-send", "-a", "Azure VPN", "Missing Dependency", "openp2s is required. Run 'azurevpn setup' in terminal."], check=False)
+        subprocess.run(["notify-send", "-a", "Azure VPN", "Missing Dependency", "openp2s is required. Run 'azurevpn setup'."], check=False)
         return 1
+
+    ensure_systemd_service()
 
     status = get_status_data()
     if status["connected"]:
         print(f"Already connected to {status['profile']} ({status['address']}).")
         return 0
 
-    auth_res = subprocess.run(["openp2s", "auth", "status"], capture_output=True, text=True)
-    if "No cached Entra sessions" in auth_res.stdout or auth_res.returncode != 0:
-        print(f"Initiating authentication for {active_profile}...")
+    try:
+        auth_res = subprocess.run([openp2s_bin, "auth", "status", str(profile_path)], capture_output=True, text=True, timeout=8)
+        needs_login = auth_res.returncode != 0 or "Refresh token: cached" not in auth_res.stdout
+    except Exception:
+        needs_login = True
+
+    if needs_login:
+        print(f"Initiating browser authentication for {active_profile}...")
         subprocess.run(["notify-send", "-a", "Azure VPN", "Authenticating", "Please complete sign-in in your browser."], check=False)
-        login_res = subprocess.run(["openp2s", "auth", "login", str(profile_path)])
-        if login_res.returncode != 0:
-            print("Authentication failed or cancelled.", file=sys.stderr)
+        try:
+            login_res = subprocess.run([openp2s_bin, "auth", "login", str(profile_path)], timeout=180)
+            if login_res.returncode != 0:
+                print("Authentication failed or cancelled.", file=sys.stderr)
+                return 1
+        except subprocess.TimeoutExpired:
+            print("Authentication timed out.", file=sys.stderr)
             return 1
 
     print(f"Connecting to {active_profile}...")
+    subprocess.run(["systemctl", "--user", "reset-failed", "azure-vpn"], check=False)
     subprocess.run(["systemctl", "--user", "start", "azure-vpn"], check=False)
 
     for _ in range(24):
@@ -263,49 +320,90 @@ def cmd_connect(profile_name=None):
             print(f"✓ Connected to {active_profile} ({st['address']}) on {st['interface']}.")
             subprocess.run(["notify-send", "-a", "Azure VPN", "VPN Connected", f"Connected to {active_profile}\nIP: {st['address']}"], check=False)
             return 0
+        if st["state"] == "failed":
+            print(f"Error: Connection service failed. View logs with: journalctl --user -u azure-vpn -n 30", file=sys.stderr)
+            subprocess.run(["notify-send", "-a", "Azure VPN", "Connection Failed", "Check journalctl --user -u azure-vpn"], check=False)
+            return 1
 
     print("Connection started in background (check status with 'azurevpn status').")
     return 0
 
 def cmd_setup():
     print("=== Azure VPN Plugin Setup & Hardening ===")
-    has_openp2s = bool(shutil.which("openp2s")) and Path("/usr/local/lib/openp2s/openvpn").exists()
     
+    if platform.machine() != "x86_64":
+        print(f"Error: Automatic binary install only supports x86_64 (detected {platform.machine()}).", file=sys.stderr)
+        print("Please build openp2s from source: https://github.com/wyruweso/openp2s", file=sys.stderr)
+        return 1
+
+    has_openp2s = bool(shutil.which("openp2s")) and Path("/usr/local/lib/openp2s/openvpn").exists()
     if has_openp2s:
         print("✓ openp2s and patched openvpn binaries found.")
     else:
-        print("Installing openp2s v0.2.0 from GitHub releases...")
-        tar_url = "https://github.com/wyruweso/openp2s/releases/download/v0.2.0/openp2s-0.2.0-linux-amd64.tar.gz"
-        tmp_tar = Path("/tmp/openp2s.tar.gz")
-        subprocess.run(["curl", "-fsSL", tar_url, "-o", str(tmp_tar)], check=True)
-        subprocess.run(["sudo", "tar", "-xzf", str(tmp_tar), "-C", "/usr/local", "--strip-components=1"], check=True)
-        if tmp_tar.exists():
-            tmp_tar.unlink()
+        print(f"Downloading openp2s v{OPENP2S_VERSION}...")
+        url = f"https://github.com/wyruweso/openp2s/releases/download/v{OPENP2S_VERSION}/openp2s-{OPENP2S_VERSION}-linux-amd64.tar.gz"
+        with tempfile.TemporaryDirectory() as td:
+            tmp_tar = Path(td) / "openp2s.tar.gz"
+            subprocess.run(["curl", "-fsSL", "--proto", "=https", "--tlsv1.2", url, "-o", str(tmp_tar)], check=True)
+            
+            digest = hashlib.sha256(tmp_tar.read_bytes()).hexdigest()
+            if digest != OPENP2S_SHA256:
+                print(f"Error: Checksum mismatch on openp2s download!\nExpected: {OPENP2S_SHA256}\nGot:      {digest}", file=sys.stderr)
+                return 1
+            print("✓ Checksum verified.")
+            subprocess.run(["sudo", "tar", "-xzf", str(tmp_tar), "-C", "/usr/local", "--strip-components=1"], check=True)
         print("✓ openp2s installed to /usr/local/bin/openp2s")
 
-    # Hardening: Sudoers rule
-    sudoers_path = Path("/etc/sudoers.d/99-openp2s")
-    if not sudoers_path.exists():
-        print("Setting up scoped sudoers rule for OpenVPN (/etc/sudoers.d/99-openp2s)...")
-        rule = "ALL ALL=(ALL) NOPASSWD: /usr/local/lib/openp2s/openvpn\n"
-        p = subprocess.Popen(["sudo", "tee", str(sudoers_path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        p.communicate(rule.encode())
-        subprocess.run(["sudo", "chmod", "0440", str(sudoers_path)], check=True)
-        print("✓ Sudoers rule created.")
-    else:
-        print("✓ Sudoers rule already exists.")
-
-    # Hardening: File permissions
-    ensure_dirs()
-    print("✓ Secured configuration directory permissions (0700).")
+    # Scoped Sudoers Rule
+    user = getpass.getuser()
+    resolvectl_bin = shutil.which("resolvectl") or "/usr/bin/resolvectl"
+    rule = f"{user} ALL=(root) NOPASSWD: /usr/local/lib/openp2s/openvpn, {resolvectl_bin}\n"
     
-    print("\n✓ Setup complete! You can now import profiles and connect seamlessly.")
+    print(f"Configuring scoped sudoers rule for user '{user}'...")
+    with tempfile.NamedTemporaryFile("w", suffix=".sudoers", delete=False) as tf:
+        tf.write(rule)
+        tmp_sudoers = tf.name
+
+    try:
+        check = subprocess.run(["visudo", "-c", "-f", tmp_sudoers], capture_output=True, text=True)
+        if check.returncode != 0:
+            print(f"Error: generated sudoers rule failed visudo syntax validation: {check.stderr}", file=sys.stderr)
+            return 1
+        subprocess.run(["sudo", "install", "-m", "0440", "-o", "root", "-g", "root", tmp_sudoers, "/etc/sudoers.d/99-openp2s"], check=True)
+        print("✓ Scoped sudoers rule verified and installed (/etc/sudoers.d/99-openp2s).")
+    finally:
+        if os.path.exists(tmp_sudoers):
+            os.unlink(tmp_sudoers)
+
+    ensure_dirs()
+    ensure_systemd_service()
+    print("✓ Secured configuration directory permissions (0700).")
+    print("✓ Systemd background service registered.")
+    print("\n✓ Setup complete! Import your profile with:")
+    print("  azurevpn import <profile.xml>")
+    return 0
+
+def cmd_teardown():
+    print("=== Azure VPN Plugin Teardown ===")
+    subprocess.run(["systemctl", "--user", "stop", "azure-vpn"], check=False)
+    subprocess.run(["systemctl", "--user", "disable", "azure-vpn"], check=False)
+    
+    if SERVICE_FILE.exists():
+        SERVICE_FILE.unlink()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print("✓ Removed systemd user service.")
+
+    sudoers_path = Path("/etc/sudoers.d/99-openp2s")
+    if sudoers_path.exists():
+        subprocess.run(["sudo", "rm", "-f", str(sudoers_path)], check=True)
+        print("✓ Removed /etc/sudoers.d/99-openp2s.")
+
+    print("✓ Teardown complete.")
     return 0
 
 def cmd_disconnect():
     print("Disconnecting Azure VPN...")
     subprocess.run(["systemctl", "--user", "stop", "azure-vpn"], check=False)
-    subprocess.run(["openp2s", "disconnect"], capture_output=True, check=False)
     subprocess.run(["notify-send", "-a", "Azure VPN", "VPN Disconnected", "Disconnected from Azure VPN."], check=False)
     print("✓ Disconnected.")
     return 0
@@ -321,10 +419,13 @@ def cmd_daemon():
         print(f"Error: Profile file not found: {profile_path}", file=sys.stderr)
         sys.exit(1)
 
-    args = ["openp2s", "connect", str(profile_path), "--allow-system-trust-store"]
+    openp2s_bin = shutil.which("openp2s") or "/usr/local/bin/openp2s"
+    args = [openp2s_bin, "connect", str(profile_path)]
+    if cfg.get("allow_system_trust_store", False):
+        args.append("--allow-system-trust-store")
     if cfg.get("dns_all", False):
         args.append("--dns-all")
-    os.execvp("openp2s", args)
+    os.execvp(openp2s_bin, args)
 
 def main():
     ensure_dirs()
@@ -381,10 +482,12 @@ def main():
         sys.exit(import_dialog())
     elif cmd in ("setup", "install-deps"):
         sys.exit(cmd_setup())
+    elif cmd in ("teardown", "uninstall"):
+        sys.exit(cmd_teardown())
     elif cmd == "daemon":
         cmd_daemon()
     else:
-        print("Usage: azurevpn [connect [profile] | disconnect | status [--json] | list | select <profile> | import [file.xml] | setup]")
+        print("Usage: azurevpn [connect [profile] | disconnect | status [--json] | list | select <profile> | import [file.xml] | setup | teardown]")
 
 if __name__ == "__main__":
     main()
