@@ -30,6 +30,8 @@ def ensure_systemd_service():
 Description=Azure VPN Client Background Service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=30s
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -37,8 +39,6 @@ ExecStart={SELF_PATH} daemon
 ExecStop={openp2s_bin} disconnect
 Restart=on-failure
 RestartSec=3s
-StartLimitIntervalSec=30s
-StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
@@ -65,7 +65,7 @@ def ensure_dirs():
             json.dump({
                 "active_profile": "",
                 "dns_all": False,
-                "allow_system_trust_store": False
+                "allow_system_trust_store": True
             }, f, indent=2)
     CONFIG_FILE.chmod(0o600)
 
@@ -79,9 +79,15 @@ def load_config():
     ensure_dirs()
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
-        return {"active_profile": "", "dns_all": False, "allow_system_trust_store": False}
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg.setdefault("active_profile", "")
+    cfg.setdefault("dns_all", False)
+    cfg.setdefault("allow_system_trust_store", True)
+    return cfg
 
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -310,7 +316,7 @@ def cmd_connect(profile_name=None):
             return 1
 
     print(f"Connecting to {active_profile}...")
-    subprocess.run(["systemctl", "--user", "reset-failed", "azure-vpn"], check=False)
+    subprocess.run(["systemctl", "--user", "reset-failed", "azure-vpn"], capture_output=True, check=False)
     subprocess.run(["systemctl", "--user", "start", "azure-vpn"], check=False)
 
     for _ in range(24):
@@ -421,7 +427,7 @@ def cmd_daemon():
 
     openp2s_bin = shutil.which("openp2s") or "/usr/local/bin/openp2s"
     args = [openp2s_bin, "connect", str(profile_path)]
-    if cfg.get("allow_system_trust_store", False):
+    if cfg.get("allow_system_trust_store", True):
         args.append("--allow-system-trust-store")
     if cfg.get("dns_all", False):
         args.append("--dns-all")
