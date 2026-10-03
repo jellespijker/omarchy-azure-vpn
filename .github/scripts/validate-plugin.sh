@@ -12,6 +12,10 @@ REQUIRED_FILES=(
   "preview.png"
   "Panel.qml"
   "bin/azurevpn"
+  "libexec/azurevpn-helper"
+  "libexec/azurevpn-sudo"
+  "tests/test_helper.py"
+  "tests/test_sudoers.py"
 )
 
 for file in "${REQUIRED_FILES[@]}"; do
@@ -30,8 +34,18 @@ echo "✓ bin/azurevpn is executable"
 
 echo ""
 echo "=== 2. Validating Python Syntax ==="
-python3 -m py_compile "$ROOT_DIR/bin/azurevpn"
-echo "✓ bin/azurevpn compiled cleanly"
+for f in bin/azurevpn libexec/azurevpn-helper libexec/azurevpn-sudo; do
+  python3 - "$ROOT_DIR/$f" <<'PY'
+import sys
+compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")
+PY
+  echo "✓ $f compiled cleanly"
+done
+
+echo ""
+echo "=== 2b. Running Unit Tests ==="
+(cd "$ROOT_DIR" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t . -v)
+echo "✓ Unit tests passed"
 
 echo ""
 echo "=== 3. Validating manifest.json ==="

@@ -23,9 +23,62 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 SERVICE_FILE = SYSTEMD_USER_DIR / "azure-vpn.service"
 
+# Privileged helper: installed root-owned; the only thing sudo may run.
+PLUGIN_ROOT = Path(SELF_PATH).parent.parent
+HELPER_SRC = PLUGIN_ROOT / "libexec" / "azurevpn-helper"
+SUDO_SHIM_SRC = PLUGIN_ROOT / "libexec" / "azurevpn-sudo"
+HELPER_DIR = "/usr/local/lib/azurevpn"
+HELPER_PATH = f"{HELPER_DIR}/azurevpn-helper"
+SUDOERS_FILE = "/etc/sudoers.d/99-azurevpn"
+LEGACY_SUDOERS_FILE = "/etc/sudoers.d/99-openp2s"  # pre-1.0.2 unrestricted rule
+OPENVPN_BIN = "/usr/local/lib/openp2s/openvpn"
+# Each subcommand is granted separately with NO trailing arguments, so sudo
+# matches the command line exactly. Variable inputs travel over stdin or are
+# derived by the helper itself and are validated there.
+HELPER_SUBCOMMANDS = ("connect", "dns-servers", "dns-domains", "dns-default-route", "dns-revert")
+USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def build_sudoers_rule(user, helper_path=HELPER_PATH):
+    """Return the sudoers drop-in text granting `user` only the helper.
+
+    Raises ValueError for user names that could change the rule's meaning.
+    """
+    if not USERNAME_RE.match(user or "") or user == "root":
+        raise ValueError(f"refusing to generate a sudoers rule for user name {user!r}")
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", helper_path) or ".." in helper_path:
+        raise ValueError(f"unsafe helper path {helper_path!r}")
+    cmds = ", \\\n    ".join(f"{helper_path} {sub}" for sub in HELPER_SUBCOMMANDS)
+    return (
+        "# Managed by 'azurevpn setup' (omarchy-azure-vpn). Remove with 'azurevpn teardown'.\n"
+        "# Grants ONLY the root-owned helper, one explicit command line per operation.\n"
+        f"Cmnd_Alias AZUREVPN_HELPER = \\\n    {cmds}\n"
+        "Defaults!AZUREVPN_HELPER env_reset, !setenv\n"
+        f"{user} ALL=(root) NOPASSWD: AZUREVPN_HELPER\n"
+    )
+
+
+def sudo_shim_dir():
+    """Private per-user dir holding a `sudo` symlink to the translation shim."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    d = Path(base) / "azurevpn-shim"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    d.chmod(0o700)
+    link = d / "sudo"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(SUDO_SHIM_SRC)
+    return d
+
+
+def openp2s_env():
+    """Environment for openp2s: PATH starts with the sudo shim directory."""
+    env = dict(os.environ)
+    env["PATH"] = f"{sudo_shim_dir()}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    return env
+
 def ensure_systemd_service():
     SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
-    openp2s_bin = shutil.which("openp2s") or "/usr/local/bin/openp2s"
     service_content = f"""[Unit]
 Description=Azure VPN Client Background Service
 After=network-online.target
@@ -36,7 +89,7 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart={SELF_PATH} daemon
-ExecStop={openp2s_bin} disconnect
+ExecStop={SELF_PATH} daemon-stop
 Restart=on-failure
 RestartSec=3s
 
@@ -284,8 +337,8 @@ def cmd_connect(profile_name=None):
         return 1
 
     openp2s_bin = shutil.which("openp2s")
-    if not openp2s_bin or not Path("/usr/local/lib/openp2s/openvpn").exists():
-        print("Error: 'openp2s' or its patched openvpn binary is not installed.", file=sys.stderr)
+    if not openp2s_bin or not Path(OPENVPN_BIN).exists() or not Path(HELPER_PATH).exists():
+        print("Error: 'openp2s', its patched openvpn binary or the privileged helper is not installed.", file=sys.stderr)
         print("Run 'azurevpn setup' to automatically install prerequisites and configure permissions.", file=sys.stderr)
         subprocess.run(["notify-send", "-a", "Azure VPN", "Missing Dependency", "openp2s is required. Run 'azurevpn setup'."], check=False)
         return 1
@@ -342,7 +395,7 @@ def cmd_setup():
         print("Please build openp2s from source: https://github.com/wyruweso/openp2s", file=sys.stderr)
         return 1
 
-    has_openp2s = bool(shutil.which("openp2s")) and Path("/usr/local/lib/openp2s/openvpn").exists()
+    has_openp2s = bool(shutil.which("openp2s")) and Path(OPENVPN_BIN).exists()
     if has_openp2s:
         print("✓ openp2s and patched openvpn binaries found.")
     else:
@@ -360,26 +413,40 @@ def cmd_setup():
             subprocess.run(["sudo", "tar", "-xzf", str(tmp_tar), "-C", "/usr/local", "--strip-components=1"], check=True)
         print("✓ openp2s installed to /usr/local/bin/openp2s")
 
-    # Scoped Sudoers Rule
+    # Root-owned helper + exact-command sudoers rule
     user = getpass.getuser()
-    resolvectl_bin = shutil.which("resolvectl") or "/usr/bin/resolvectl"
-    rule = f"{user} ALL=(root) NOPASSWD: /usr/local/lib/openp2s/openvpn, {resolvectl_bin}\n"
-    
-    print(f"Configuring scoped sudoers rule for user '{user}'...")
-    with tempfile.NamedTemporaryFile("w", suffix=".sudoers", delete=False) as tf:
-        tf.write(rule)
-        tmp_sudoers = tf.name
-
     try:
-        check = subprocess.run(["visudo", "-c", "-f", tmp_sudoers], capture_output=True, text=True)
+        rule = build_sudoers_rule(user)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if not HELPER_SRC.is_file():
+        print(f"Error: helper source missing: {HELPER_SRC}", file=sys.stderr)
+        return 1
+
+    print(f"Installing root-owned helper to {HELPER_PATH}...")
+    with tempfile.TemporaryDirectory() as td:
+        staged = Path(td) / "azurevpn-helper"
+        shutil.copyfile(HELPER_SRC, staged)
+        tmp_sudoers = Path(td) / "99-azurevpn"
+        tmp_sudoers.write_text(rule, encoding="utf-8")
+        check = subprocess.run(["visudo", "-c", "-f", str(tmp_sudoers)], capture_output=True, text=True)
         if check.returncode != 0:
-            print(f"Error: generated sudoers rule failed visudo syntax validation: {check.stderr}", file=sys.stderr)
+            print(f"Error: generated sudoers rule failed visudo validation: {check.stderr}", file=sys.stderr)
             return 1
-        subprocess.run(["sudo", "install", "-m", "0440", "-o", "root", "-g", "root", tmp_sudoers, "/etc/sudoers.d/99-openp2s"], check=True)
-        print("✓ Scoped sudoers rule verified and installed (/etc/sudoers.d/99-openp2s).")
-    finally:
-        if os.path.exists(tmp_sudoers):
-            os.unlink(tmp_sudoers)
+        # Parents are created root:root 0755; the helper is root:root 0755.
+        subprocess.run(["sudo", "install", "-d", "-m", "0755", "-o", "root", "-g", "root", HELPER_DIR], check=True)
+        subprocess.run(["sudo", "install", "-m", "0755", "-o", "root", "-g", "root", str(staged), HELPER_PATH], check=True)
+        st = os.stat(HELPER_PATH)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            print("Error: installed helper is not root-owned and non-writable; aborting.", file=sys.stderr)
+            return 1
+        # Install the rule last, so the grant never exists without the helper.
+        subprocess.run(["sudo", "install", "-m", "0440", "-o", "root", "-g", "root", str(tmp_sudoers), SUDOERS_FILE], check=True)
+    print(f"✓ Helper installed ({HELPER_PATH}) and exact-command sudoers rule installed ({SUDOERS_FILE}).")
+    if Path(LEGACY_SUDOERS_FILE).exists():
+        subprocess.run(["sudo", "rm", "-f", LEGACY_SUDOERS_FILE], check=True)
+        print(f"✓ Removed the legacy unrestricted rule ({LEGACY_SUDOERS_FILE}).")
 
     ensure_dirs()
     ensure_systemd_service()
@@ -399,10 +466,16 @@ def cmd_teardown():
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         print("✓ Removed systemd user service.")
 
-    sudoers_path = Path("/etc/sudoers.d/99-openp2s")
-    if sudoers_path.exists():
-        subprocess.run(["sudo", "rm", "-f", str(sudoers_path)], check=True)
-        print("✓ Removed /etc/sudoers.d/99-openp2s.")
+    for rule_file in (SUDOERS_FILE, LEGACY_SUDOERS_FILE):
+        if Path(rule_file).exists():
+            subprocess.run(["sudo", "rm", "-f", rule_file], check=True)
+            print(f"✓ Removed {rule_file}.")
+
+    if Path(HELPER_DIR).exists():
+        subprocess.run(["sudo", "rm", "-rf", HELPER_DIR], check=True)
+        print(f"✓ Removed {HELPER_DIR}.")
+    if Path("/run/azurevpn").exists():
+        subprocess.run(["sudo", "rm", "-rf", "/run/azurevpn"], check=True)
 
     print("✓ Teardown complete.")
     return 0
@@ -431,7 +504,12 @@ def cmd_daemon():
         args.append("--allow-system-trust-store")
     if cfg.get("dns_all", False):
         args.append("--dns-all")
-    os.execvp(openp2s_bin, args)
+    os.execvpe(openp2s_bin, args, openp2s_env())
+
+
+def cmd_daemon_stop():
+    openp2s_bin = shutil.which("openp2s") or "/usr/local/bin/openp2s"
+    os.execvpe(openp2s_bin, [openp2s_bin, "disconnect"], openp2s_env())
 
 def main():
     ensure_dirs()
@@ -492,6 +570,8 @@ def main():
         sys.exit(cmd_teardown())
     elif cmd == "daemon":
         cmd_daemon()
+    elif cmd == "daemon-stop":
+        cmd_daemon_stop()
     else:
         print("Usage: azurevpn [connect [profile] | disconnect | status [--json] | list | select <profile> | import [file.xml] | setup | teardown]")
 

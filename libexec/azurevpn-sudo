@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""azurevpn-sudo: unprivileged `sudo` shim used only for the openp2s process.
+
+openp2s escalates by running `sudo -- <openvpn> --config <file>` and
+`sudo -- resolvectl <verb> ...`.  The plugin puts this shim first on PATH for
+that process only, and it translates exactly those command lines into calls to
+the root-owned helper:
+
+    sudo -n -- /usr/local/lib/azurevpn/azurevpn-helper <subcommand>
+
+This file is NOT a security boundary (the user owns it).  The boundary is the
+helper and the exact-command sudoers rule.  The shim refuses everything it does
+not recognise so that nothing unexpected ever reaches sudo.
+"""
+import os
+import sys
+
+REAL_SUDO = "/usr/bin/sudo"
+HELPER = "/usr/local/lib/azurevpn/azurevpn-helper"
+OPENVPN_BIN = "/usr/local/lib/openp2s/openvpn"
+RESOLVECTL_VERBS = {
+    "dns": "dns-servers",
+    "domain": "dns-domains",
+    "default-route": "dns-default-route",
+    "revert": "dns-revert",
+}
+
+
+def translate(argv, uid):
+    """Return (helper_subcommand, stdin_text) or raise ValueError."""
+    args = list(argv)
+    if args and args[0] == "--":
+        args = args[1:]
+    if not args:
+        raise ValueError("no command")
+    cmd, rest = args[0], args[1:]
+    if cmd == OPENVPN_BIN:
+        if rest != ["--config", f"/run/user/{uid}/openp2s/openvpn.conf"]:
+            raise ValueError("unexpected openvpn arguments")
+        return "connect", ""
+    if os.path.basename(cmd) == "resolvectl" and rest and rest[0] in RESOLVECTL_VERBS:
+        verb, vals = rest[0], rest[1:]
+        if not vals:
+            raise ValueError("missing interface")
+        if verb == "default-route" and vals[1:] != ["no"]:
+            raise ValueError("only 'default-route <if> no' is supported")
+        if verb == "default-route":
+            vals = vals[:1]
+        return RESOLVECTL_VERBS[verb], "\n".join(vals) + "\n"
+    raise ValueError("command not supported")
+
+
+def main():
+    try:
+        sub, stdin_text = translate(sys.argv[1:], os.getuid())
+    except ValueError as exc:
+        sys.stderr.write(f"azurevpn-sudo: refusing: {exc}\n")
+        return 126
+    r, w = os.pipe()
+    os.write(w, stdin_text.encode("utf-8", "replace")[:8192])
+    os.close(w)
+    os.dup2(r, 0)
+    os.close(r)
+    os.execv(REAL_SUDO, [REAL_SUDO, "-n", "--", HELPER, sub])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

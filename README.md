@@ -15,6 +15,7 @@ A fast, lightweight, and completely headless **Microsoft Azure Point-to-Site (P2
 - **Profile Management**: Import any standard Azure VPN `.xml` package directly from a file dialog or CLI with automatic XML validation.
 - **Split DNS & Routing**: Automatically resolves enterprise DNS via `systemd-resolved` (`resolvectl`) and routes corporate subnets.
 - **Systemd Managed**: Background tunnel managed as an isolated `systemd --user` service.
+- **Least-privilege root access**: sudo is granted only to a root-owned helper with five exact command lines; see [Security model](#security-model).
 
 ---
 
@@ -43,9 +44,57 @@ Run the built-in setup wizard:
 
 This will:
 1. Verify or automatically install `openp2s` and its companion OpenVPN binary into `/usr/local/bin` and `/usr/local/lib/openp2s/` (verified against SHA256 checksum).
-2. Configure a scoped sudoers rule in `/etc/sudoers.d/99-openp2s` (validated via `visudo -c`) granting your specific user account passwordless execution for `/usr/local/lib/openp2s/openvpn` and `/usr/bin/resolvectl`.
+2. Install a small root-owned helper to `/usr/local/lib/azurevpn/azurevpn-helper` (`root:root`, `0755`, in a root-owned `0755` directory) and a sudoers rule in `/etc/sudoers.d/99-azurevpn` (validated with `visudo -c` before install) that lets your user run **only that helper**, with one explicit command line per operation (see [Security model](#security-model)). A legacy `/etc/sudoers.d/99-openp2s` rule from plugin versions before 1.0.2 is removed.
 3. Secure profile and token directory permissions (`0700` / `0600`).
 4. Register the systemd user service (`azure-vpn.service`).
+
+---
+
+## Security model
+
+Earlier versions (<= 1.0.1) granted passwordless root for `/usr/local/lib/openp2s/openvpn` and `resolvectl` with unrestricted arguments. OpenVPN accepts script and plugin options (`--script-security`, `--up`, `--plugin`, `--config`, ...), so that was equivalent to passwordless root. Since 1.0.2 sudo is granted to a helper only.
+
+**What sudo allows.** The sudoers rule (`/etc/sudoers.d/99-azurevpn`) names exactly five command lines and no wildcards:
+
+```
+/usr/local/lib/azurevpn/azurevpn-helper connect
+/usr/local/lib/azurevpn/azurevpn-helper dns-servers
+/usr/local/lib/azurevpn/azurevpn-helper dns-domains
+/usr/local/lib/azurevpn/azurevpn-helper dns-default-route
+/usr/local/lib/azurevpn/azurevpn-helper dns-revert
+```
+
+No subcommand takes arguments, so a caller cannot append options. The environment is reset (`env_reset`, `!setenv`).
+
+**What the helper does.**
+
+- `connect` reads the config that `openp2s` wrote to `/run/user/<your uid>/openp2s/openvpn.conf` (path derived from `SUDO_UID`, never supplied; must be a regular, non-symlink file owned by you). It validates every directive against an allow-list, rebuilds a clean copy in the root-only `/run/azurevpn/`, and runs the root-owned `/usr/local/lib/openp2s/openvpn --config <that copy>` with a minimal environment. No other option is ever passed.
+- It **rejects** anything outside the allow-list, including `script-security`, `up`, `down`, `plugin`, `route-up`, `route-pre-down`, `ipchange`, `learn-address`, `tls-verify`, `client-connect`, `client-disconnect`, `auth-user-pass-verify`, `config`, `include`, `setenv`, `cd`, `chroot`, `management-client-user`, file-path options such as `key`, `cert`, `log`, `status`, `writepid`, credentials *files*, `ca` paths other than known system CA bundles, and control characters, quotes, `;`, `#` or backslashes in a directive. Inline blocks other than `<ca>` and `<tls-auth>` are rejected, and block bodies must be PEM or key material.
+- The management socket must sit directly in your own `/run/user/<uid>/openp2s/` directory. The Entra token only travels over it, never through files or arguments.
+- `dns-*` read the interface and values from stdin and run fixed `resolvectl dns|domain|default-route <if> no|revert` operations. The interface must match `tun<N>` and be a real tun device; DNS servers must be IP addresses; domains must be valid DNS names (or `~.`).
+
+`openp2s` itself runs unprivileged and calls `sudo`; the plugin puts a small shim named `sudo` (`libexec/azurevpn-sudo`) first on `PATH` **for that process only**. It translates the two command shapes `openp2s` uses into helper calls and refuses everything else. The shim is a convenience, not a security boundary: the helper and the sudoers rule are.
+
+**Residual trust.** You can still ask the helper to start a tunnel to a gateway named in a config you control, as with any "user may start a VPN" policy. The helper does not hard-code Azure gateway names.
+
+### What is installed where
+
+| Path | Owner / mode | Purpose |
+|---|---|---|
+| `/usr/local/lib/azurevpn/azurevpn-helper` | `root:root` `0755` | privileged helper |
+| `/etc/sudoers.d/99-azurevpn` | `root:root` `0440` | exact-command rule for the helper |
+| `/run/azurevpn/` | `root` `0700` (tmpfs) | validated config copy, created at connect time |
+| `/usr/local/bin/openp2s`, `/usr/local/lib/openp2s/` | root | upstream binaries (existing install, or by `azurevpn setup`) |
+| `~/.config/azure-vpn/` | you `0700` | profiles and settings |
+| `~/.config/systemd/user/azure-vpn.service` | you | background service |
+
+### Running the tests
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+The tests need no root and no VPN; they cover helper argument and config validation (including negative cases for `script-security`, `up`/`down`, `plugin`, `--config` and path traversal) and the generated sudoers text.
 
 ---
 
@@ -92,6 +141,19 @@ This will:
 
 ---
 
+## Changelog
+
+### 1.0.2
+
+- **Security:** replaced the unrestricted passwordless-root sudoers grant for `openvpn` and `resolvectl` with a root-owned helper (`/usr/local/lib/azurevpn/azurevpn-helper`) and an exact-command sudoers rule. The helper rejects OpenVPN script/plugin/config options and arbitrary file paths and validates every argument. `azurevpn setup` removes the old `/etc/sudoers.d/99-openp2s` rule. **Existing installs: re-run `azurevpn setup` after updating**, otherwise connecting fails (the old rule is no longer used).
+- Added unit tests for the helper and the sudoers rule.
+
+### 1.0.1
+
+- Added CI validation and release workflows.
+
+---
+
 ## Release & Versioning
 
 Omarchy plugins track the default branch (`main`) directly when installed via `omarchy plugin add` or updated via `omarchy plugin update`. Official versions are tagged and published through GitHub Releases:
@@ -99,15 +161,15 @@ Omarchy plugins track the default branch (`main`) directly when installed via `o
 1. Update the version in `manifest.json` following Semantic Versioning (`X.Y.Z`).
 2. Run validation locally:
    ```bash
-   bash .github/scripts/validate-plugin.sh
+   bash .github/scripts/validate-plugin.sh   # also runs the unit tests
    # or
    omarchy plugin validate .
    ```
 3. Commit and push the changes to `main`.
 4. Tag and push the new version:
    ```bash
-   git tag v1.0.1
-   git push origin v1.0.1
+   git tag v1.0.2
+   git push origin v1.0.2
    ```
 5. The GitHub Actions release workflow automatically verifies manifest parity, packages distribution archives with SHA256 checksums, and publishes the GitHub Release notes.
 
@@ -115,11 +177,12 @@ Omarchy plugins track the default branch (`main`) directly when installed via `o
 
 ## Uninstallation / Teardown
 
-To cleanly remove the systemd user service and the sudoers file:
+To cleanly remove the systemd user service, the sudoers rule (`/etc/sudoers.d/99-azurevpn`, and the legacy `99-openp2s` if present), the helper (`/usr/local/lib/azurevpn/`) and `/run/azurevpn`:
 ```bash
 azurevpn teardown
 omarchy plugin remove jellespijker.azure-vpn
 ```
+`teardown` asks for your sudo password once. It does not remove `openp2s` itself.
 
 ---
 

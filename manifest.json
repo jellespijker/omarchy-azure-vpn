@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jellespijker.azure-vpn",
   "name": "Azure VPN",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Jelle Spijker",
   "license": "MIT",
   "homepage": "https://github.com/jellespijker/omarchy-azure-vpn",

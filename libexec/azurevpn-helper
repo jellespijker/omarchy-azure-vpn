@@ -1,0 +1,459 @@
+#!/usr/bin/python3 -I
+"""azurevpn-helper: the only program the Azure VPN plugin may run as root.
+
+Installed by `azurevpn setup` to /usr/local/lib/azurevpn/azurevpn-helper
+(root:root, 0755, in a root-owned directory).  The sudoers rule grants the
+invoking user NOPASSWD access to exactly these command lines and nothing else:
+
+    azurevpn-helper connect
+    azurevpn-helper dns-servers
+    azurevpn-helper dns-domains
+    azurevpn-helper dns-default-route
+    azurevpn-helper dns-revert
+
+No subcommand accepts command-line arguments.  The variable inputs come from
+places the helper validates itself:
+
+  connect            Reads the OpenVPN config that `openp2s` generated at
+                     /run/user/<SUDO_UID>/openp2s/openvpn.conf, validates every
+                     directive against a strict allow-list, rebuilds a clean
+                     copy in the root-owned /run/azurevpn, and execs the
+                     root-owned patched OpenVPN with a fixed command line
+                     (--config <that copy>).  Anything that could run code or
+                     read arbitrary files (script-security, up, down, plugin,
+                     route-up, tls-verify, config, ...) is rejected.
+  dns-*              Read the interface and values from stdin, validate them
+                     with allow-list patterns and run a fixed resolvectl
+                     operation (dns / domain / default-route no / revert).
+
+The environment is reset to a minimal fixed one before anything is executed.
+"""
+import ipaddress
+import os
+import re
+import stat
+import subprocess
+import sys
+
+OPENVPN_BIN = "/usr/local/lib/openp2s/openvpn"
+RESOLVECTL_CANDIDATES = ("/usr/bin/resolvectl", "/bin/resolvectl")
+RUN_DIR = "/run/azurevpn"
+CLEAN_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C"}
+
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_LINE = 4096
+MAX_STDIN_BYTES = 8 * 1024
+MAX_DNS_SERVERS = 8
+MAX_DNS_DOMAINS = 16
+MAX_REMOTES = 8
+
+# System CA bundles that openp2s may reference; they must be root-owned.
+ALLOWED_CA_PATHS = frozenset({
+    "/etc/ssl/certs/DigiCert_Global_Root_G2.pem",
+    "/usr/share/ca-certificates/mozilla/DigiCert_Global_Root_G2.crt",
+    "/etc/pki/ca-trust/source/anchors/DigiCert_Global_Root_G2.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+    "/etc/ssl/certs/ca-bundle.crt",
+})
+
+# Directives that take no arguments.
+BARE_DIRECTIVES = frozenset({
+    "client", "nobind", "auth-nocache", "auth-user-pass",
+    "management-client", "management-query-passwords", "management-hold",
+    "experimental-azure-compat",
+})
+# Directives whose complete argument list is fixed.
+FIXED_DIRECTIVES = {
+    "proto": ("tcp-client",),
+    "dev": ("tun",),
+    "resolv-retry": ("infinite",),
+    "remote-cert-tls": ("server",),
+    "reneg-sec": ("0",),
+    "key-direction": ("1",),
+    "cipher": ("AES-256-GCM",),
+    "data-ciphers": ("AES-256-GCM",),
+    "data-ciphers-fallback": ("AES-256-GCM",),
+    "auth": ("SHA256",),
+}
+INLINE_BLOCKS = ("ca", "tls-auth")
+REQUIRED_BARE = ("client", "auth-user-pass", "management-client",
+                 "management-query-passwords", "management-hold")
+
+HOST_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+PORT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
+VERIFY_NAME_RE = re.compile(r"^[A-Za-z0-9*][A-Za-z0-9*._-]{0,252}$")
+VERB_RE = re.compile(r"^[0-9]$")
+SOCKET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+BLOCK_LINE_RE = re.compile(
+    r"^(?:[A-Za-z0-9+/=]{1,256}|[0-9a-f]{1,256}"
+    r"|-----(?:BEGIN|END) [A-Za-z0-9 ]{1,40}-----|#[ -~]{0,200})$")
+IFACE_RE = re.compile(r"^tun[0-9]{1,4}$")
+DOMAIN_RE = re.compile(
+    r"^~?(?:\.|(?=.{1,253}$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+    r"(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*)$")
+
+
+class HelperError(Exception):
+    """A request was refused. The message is safe to show to the caller."""
+
+
+# --------------------------------------------------------------------------
+# Caller identity
+# --------------------------------------------------------------------------
+def caller_uid(environ):
+    """UID of the user that ran sudo. Never trust anything but SUDO_UID."""
+    raw = environ.get("SUDO_UID", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", raw):
+        raise HelperError("must be run through sudo by an unprivileged user")
+    uid = int(raw)
+    if uid >= 4294967294:
+        raise HelperError("invalid SUDO_UID")
+    return uid
+
+
+def runtime_dir(uid):
+    return f"/run/user/{uid}/openp2s"
+
+
+def source_config_path(uid):
+    return f"{runtime_dir(uid)}/openvpn.conf"
+
+
+# --------------------------------------------------------------------------
+# OpenVPN config validation
+# --------------------------------------------------------------------------
+def _validate_remote(args):
+    if len(args) != 2:
+        raise HelperError("remote needs exactly a host and a port")
+    host, port = args
+    if not PORT_RE.match(port) or int(port) > 65535:
+        raise HelperError(f"remote: invalid port {port!r}")
+    if HOST_RE.match(host):
+        return
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        raise HelperError(f"remote: invalid host {host!r}") from None
+
+
+def _validate_management(args, uid):
+    if len(args) != 2 or args[1] != "unix":
+        raise HelperError("management must be '<socket> unix'")
+    path = args[0]
+    prefix = runtime_dir(uid) + "/"
+    if not path.startswith(prefix) or not SOCKET_NAME_RE.match(path[len(prefix):]):
+        raise HelperError("management socket must live directly in the caller's openp2s runtime directory")
+    # A socket that already exists must be a real socket owned by the caller
+    # (not a symlink to somebody else's socket). A missing one is fine.
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != uid:
+        raise HelperError("management socket path is not a socket owned by the caller")
+
+
+def _read_block(lines, index, tag):
+    body = []
+    while index < len(lines):
+        raw = lines[index]
+        index += 1
+        stripped = raw.strip()
+        if stripped == f"</{tag}>":
+            if not body:
+                raise HelperError(f"empty <{tag}> block")
+            return body, index
+        if not BLOCK_LINE_RE.match(stripped):
+            raise HelperError(f"<{tag}> block contains a line that is not PEM/key material")
+        body.append(stripped)
+        if len(body) > 400:
+            raise HelperError(f"<{tag}> block is too long")
+    raise HelperError(f"unterminated <{tag}> block")
+
+
+def validate_openvpn_config(text, uid):
+    """Validate an OpenVPN config and return a clean rebuilt copy.
+
+    The returned text is regenerated from parsed, allow-listed tokens; none of
+    the input bytes are copied through unchecked. Raises HelperError.
+    """
+    if len(text.encode("utf-8", "replace")) > MAX_CONFIG_BYTES:
+        raise HelperError("config is too large")
+    for ch in text:
+        if ch != "\n" and not (" " <= ch <= "~"):
+            raise HelperError("config contains a control or non-ASCII character")
+
+    lines = text.split("\n")
+    out = []
+    seen_bare = set()
+    remotes = 0
+    have_ca = have_management = have_tls_auth = False
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        i += 1
+        if len(raw) > MAX_LINE:
+            raise HelperError("config line is too long")
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+
+        if line.startswith("<"):
+            m = re.fullmatch(r"<([a-z-]+)>", line)
+            if not m or m.group(1) not in INLINE_BLOCKS:
+                raise HelperError(f"inline block {line!r} is not allowed")
+            tag = m.group(1)
+            body, i = _read_block(lines, i, tag)
+            if tag == "ca":
+                have_ca = True
+            else:
+                have_tls_auth = True
+            out.append(f"<{tag}>")
+            out.extend(body)
+            out.append(f"</{tag}>")
+            continue
+
+        if any(c in line for c in "\"'\\#;<>`$|&(){}"):
+            raise HelperError(f"forbidden character in directive {line.split()[0]!r}")
+        tokens = line.split()
+        name, args = tokens[0], tokens[1:]
+
+        if name in BARE_DIRECTIVES:
+            if args:
+                raise HelperError(f"{name} takes no arguments")
+            seen_bare.add(name)
+        elif name in FIXED_DIRECTIVES:
+            if tuple(args) != FIXED_DIRECTIVES[name]:
+                raise HelperError(f"{name}: only {' '.join(FIXED_DIRECTIVES[name])!r} is allowed")
+        elif name == "remote":
+            _validate_remote(args)
+            remotes += 1
+            if remotes > MAX_REMOTES:
+                raise HelperError("too many remote entries")
+        elif name == "verify-x509-name":
+            if len(args) != 2 or args[1] != "name" or not VERIFY_NAME_RE.match(args[0]):
+                raise HelperError("verify-x509-name must be '<name> name'")
+        elif name == "verb":
+            if len(args) != 1 or not VERB_RE.match(args[0]):
+                raise HelperError("verb must be a single digit")
+        elif name == "management":
+            if have_management:
+                raise HelperError("management given twice")
+            _validate_management(args, uid)
+            have_management = True
+        elif name == "ca":
+            if len(args) != 1 or args[0] not in ALLOWED_CA_PATHS:
+                raise HelperError("ca must be an inline block or a known system CA bundle")
+            have_ca = True
+        else:
+            # Everything else is refused: script-security, up, down, plugin,
+            # route-up, route-pre-down, ipchange, learn-address, tls-verify,
+            # client-connect, client-disconnect, auth-user-pass-verify, config,
+            # include, management-client-user, setenv, cd, chroot, ...
+            raise HelperError(f"directive {name!r} is not allowed")
+        out.append(" ".join([name] + args))
+
+    missing = [d for d in REQUIRED_BARE if d not in seen_bare]
+    if missing:
+        raise HelperError(f"config lacks required directive(s): {', '.join(missing)}")
+    if remotes == 0 or not have_ca or not have_management or not have_tls_auth:
+        raise HelperError("config lacks a remote, CA, management socket or tls-auth key")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Filesystem trust checks
+# --------------------------------------------------------------------------
+def assert_root_owned_chain(path, root_uid=0, lstat=os.lstat):
+    """Every component of path must be root-owned, non-symlink and not
+    group/world writable."""
+    if not path.startswith("/") or ".." in path.split("/"):
+        raise HelperError(f"untrusted path {path!r}")
+    current = ""
+    for part in [p for p in path.split("/") if p]:
+        current += "/" + part
+        try:
+            st = lstat(current)
+        except OSError as exc:
+            raise HelperError(f"cannot stat {current}: {exc.strerror}") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise HelperError(f"{current} is a symlink")
+        if st.st_uid != root_uid:
+            raise HelperError(f"{current} is not root-owned")
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HelperError(f"{current} is group/world writable")
+
+
+def read_user_config(uid, path=None):
+    """Read the caller's generated config safely (no symlink, owned by caller)."""
+    path = path or source_config_path(uid)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as exc:
+        raise HelperError(f"cannot open {path}: {exc.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1:
+            raise HelperError("config is not a plain file owned by the caller")
+        if st.st_size > MAX_CONFIG_BYTES:
+            raise HelperError("config is too large")
+        data = os.read(fd, MAX_CONFIG_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise HelperError("config is too large")
+    try:
+        return data.decode("ascii")
+    except UnicodeDecodeError:
+        raise HelperError("config is not ASCII") from None
+
+
+def write_private_config(clean_text, uid, run_dir=RUN_DIR):
+    """Write the validated copy into a root-only directory; return its path."""
+    try:
+        os.mkdir(run_dir, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(run_dir)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise HelperError(f"{run_dir} is not a directory")
+    if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        raise HelperError(f"{run_dir} must be private and owned by the helper's user")
+    dest = f"{run_dir}/openvpn-{uid}.conf"
+    try:
+        os.unlink(dest)
+    except FileNotFoundError:
+        pass
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, clean_text.encode("ascii"))
+    finally:
+        os.close(fd)
+    return dest
+
+
+def build_openvpn_argv(config_path):
+    """The one and only OpenVPN command line the helper will ever run."""
+    return [OPENVPN_BIN, "--config", config_path]
+
+
+# --------------------------------------------------------------------------
+# DNS requests (read from stdin)
+# --------------------------------------------------------------------------
+def parse_iface(line):
+    iface = line.strip()
+    if not IFACE_RE.match(iface):
+        raise HelperError(f"invalid interface name {iface!r}")
+    return iface
+
+
+def parse_dns_request(kind, stdin_text):
+    """Return the resolvectl argument vector (without the binary) for kind."""
+    if len(stdin_text) > MAX_STDIN_BYTES:
+        raise HelperError("request too large")
+    lines = [ln.strip() for ln in stdin_text.split("\n")]
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        raise HelperError("missing interface")
+    iface = parse_iface(lines[0])
+    values = lines[1:]
+    if kind == "dns-servers":
+        if not 1 <= len(values) <= MAX_DNS_SERVERS:
+            raise HelperError(f"between 1 and {MAX_DNS_SERVERS} DNS servers required")
+        clean = []
+        for v in values:
+            if not re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", v):
+                raise HelperError(f"invalid DNS server {v!r}")
+            try:
+                clean.append(str(ipaddress.ip_address(v)))
+            except ValueError:
+                raise HelperError(f"invalid DNS server {v!r}") from None
+        return ["dns", iface] + clean
+    if kind == "dns-domains":
+        if not 1 <= len(values) <= MAX_DNS_DOMAINS:
+            raise HelperError(f"between 1 and {MAX_DNS_DOMAINS} DNS domains required")
+        for v in values:
+            if not DOMAIN_RE.match(v):
+                raise HelperError(f"invalid DNS domain {v!r}")
+        return ["domain", iface] + values
+    if kind == "dns-default-route":
+        if values:
+            raise HelperError("unexpected extra input")
+        return ["default-route", iface, "no"]
+    if kind == "dns-revert":
+        if values:
+            raise HelperError("unexpected extra input")
+        return ["revert", iface]
+    raise HelperError(f"unknown request {kind!r}")
+
+
+def find_resolvectl(exists=os.path.exists):
+    for cand in RESOLVECTL_CANDIDATES:
+        if exists(cand):
+            return cand
+    raise HelperError("resolvectl not found")
+
+
+def iface_is_tun(iface, sys_net="/sys/class/net"):
+    return os.path.exists(f"{sys_net}/{iface}/tun_flags")
+
+
+# --------------------------------------------------------------------------
+# Entry points
+# --------------------------------------------------------------------------
+SUBCOMMANDS = ("connect", "dns-servers", "dns-domains", "dns-default-route", "dns-revert")
+
+
+def do_connect(environ):
+    uid = caller_uid(environ)
+    clean = validate_openvpn_config(read_user_config(uid), uid)
+    for ca in re.findall(r"(?m)^ca (\S+)$", clean):
+        # CA bundles are commonly symlinks into /etc/ssl; the resolved target
+        # chain must be root-owned and not writable by anyone else.
+        assert_root_owned_chain(os.path.realpath(ca))
+    assert_root_owned_chain(OPENVPN_BIN)
+    dest = write_private_config(clean, uid)
+    argv = build_openvpn_argv(dest)
+    os.execve(argv[0], argv, dict(CLEAN_ENV))
+
+
+def do_dns(kind, environ):
+    caller_uid(environ)
+    stdin_text = sys.stdin.read(MAX_STDIN_BYTES + 1)
+    argv = parse_dns_request(kind, stdin_text)
+    if not iface_is_tun(argv[1]):
+        raise HelperError(f"{argv[1]} is not a tun interface")
+    cmd = [find_resolvectl()] + argv
+    res = subprocess.run(cmd, env=dict(CLEAN_ENV), stdin=subprocess.DEVNULL, timeout=15, check=False)
+    return res.returncode
+
+
+def main(argv=None, environ=None, euid=None):
+    argv = sys.argv[1:] if argv is None else argv
+    environ = os.environ if environ is None else environ
+    try:
+        if (os.geteuid() if euid is None else euid) != 0:
+            raise HelperError("must run as root (via sudo)")
+        if len(argv) != 1 or argv[0] not in SUBCOMMANDS:
+            raise HelperError("usage: azurevpn-helper {" + "|".join(SUBCOMMANDS) + "} (no further arguments)")
+        if argv[0] == "connect":
+            do_connect(environ)
+            return 1  # not reached; execve replaces the process
+        return do_dns(argv[0], environ)
+    except HelperError as exc:
+        sys.stderr.write(f"azurevpn-helper: refused: {exc}\n")
+        return 2
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write(f"azurevpn-helper: error: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
