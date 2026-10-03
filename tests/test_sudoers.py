@@ -92,3 +92,26 @@ class ServiceAndInstallConstants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RootOnlyPathTests(unittest.TestCase):
+    """/etc/sudoers.d cannot be searched by a normal user, so a plain Path.exists() says "no" for a rule that is there (found in the
+    first real-root smoke test: the old unrestricted rule was never removed)."""
+
+    def test_existence_is_asked_of_root_not_of_the_current_user(self):
+        calls = []
+
+        class R:
+            returncode = 0
+        orig = cli.subprocess.run
+        cli.subprocess.run = lambda cmd, **kw: (calls.append(cmd), R())[1]
+        try:
+            self.assertTrue(cli.sudo_exists("/etc/sudoers.d/99-openp2s"))
+        finally:
+            cli.subprocess.run = orig
+        self.assertEqual(calls, [["sudo", "test", "-e", "/etc/sudoers.d/99-openp2s"]])
+
+    def test_setup_and_teardown_do_not_use_path_exists_for_the_rule_files(self):
+        src = (ROOT / "bin" / "azurevpn").read_text()
+        self.assertNotIn("Path(LEGACY_SUDOERS_FILE).exists()", src)
+        self.assertNotIn("Path(rule_file).exists()", src)

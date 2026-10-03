@@ -387,6 +387,12 @@ def cmd_connect(profile_name=None):
     print("Connection started in background (check status with 'azurevpn status').")
     return 0
 
+def sudo_exists(path: str) -> bool:
+    """Does a root-only path exist? /etc/sudoers.d is not even searchable by a normal user, so Path.exists() would say False for a rule that
+    is really there. Ask root instead."""
+    return subprocess.run(["sudo", "test", "-e", path], check=False).returncode == 0
+
+
 def cmd_setup():
     print("=== Azure VPN Plugin Setup & Hardening ===")
     
@@ -444,7 +450,7 @@ def cmd_setup():
         # Install the rule last, so the grant never exists without the helper.
         subprocess.run(["sudo", "install", "-m", "0440", "-o", "root", "-g", "root", str(tmp_sudoers), SUDOERS_FILE], check=True)
     print(f"✓ Helper installed ({HELPER_PATH}) and exact-command sudoers rule installed ({SUDOERS_FILE}).")
-    if Path(LEGACY_SUDOERS_FILE).exists():
+    if sudo_exists(LEGACY_SUDOERS_FILE):
         subprocess.run(["sudo", "rm", "-f", LEGACY_SUDOERS_FILE], check=True)
         print(f"✓ Removed the legacy unrestricted rule ({LEGACY_SUDOERS_FILE}).")
 
@@ -467,7 +473,7 @@ def cmd_teardown():
         print("✓ Removed systemd user service.")
 
     for rule_file in (SUDOERS_FILE, LEGACY_SUDOERS_FILE):
-        if Path(rule_file).exists():
+        if sudo_exists(rule_file):
             subprocess.run(["sudo", "rm", "-f", rule_file], check=True)
             print(f"✓ Removed {rule_file}.")
 
