@@ -143,6 +143,10 @@ The tests need no root and no VPN; they cover helper argument and config validat
 
 ## Changelog
 
+### 1.0.3
+
+- Fix: `azurevpn setup` and `teardown` now ask root whether the sudoers rules exist. `/etc/sudoers.d` is not searchable by a normal user, so the old unrestricted rule from 1.0.1 and earlier was reported as absent and never removed. Found in a real-root smoke test (setup, hostile configs rejected, connect, DNS, disconnect, reconnect).
+
 ### 1.0.2
 
 - **Security:** replaced the unrestricted passwordless-root sudoers grant for `openvpn` and `resolvectl` with a root-owned helper (`/usr/local/lib/azurevpn/azurevpn-helper`) and an exact-command sudoers rule. The helper rejects OpenVPN script/plugin/config options and arbitrary file paths and validates every argument. `azurevpn setup` removes the old `/etc/sudoers.d/99-openp2s` rule. **Existing installs: re-run `azurevpn setup` after updating**, otherwise connecting fails (the old rule is no longer used).
@@ -168,8 +172,8 @@ Omarchy plugins track the default branch (`main`) directly when installed via `o
 3. Commit and push the changes to `main`.
 4. Tag and push the new version:
    ```bash
-   git tag v1.0.2
-   git push origin v1.0.2
+   git tag v1.0.3
+   git push origin v1.0.3
    ```
 5. The GitHub Actions release workflow automatically verifies manifest parity, packages distribution archives with SHA256 checksums, and publishes the GitHub Release notes.
 
