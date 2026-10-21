@@ -8,6 +8,7 @@ import time
 import shutil
 import getpass
 import tempfile
+import tarfile
 import hashlib
 import platform
 import xml.etree.ElementTree as ET
@@ -32,6 +33,7 @@ HELPER_PATH = f"{HELPER_DIR}/azurevpn-helper"
 SUDOERS_FILE = "/etc/sudoers.d/99-azurevpn"
 LEGACY_SUDOERS_FILE = "/etc/sudoers.d/99-openp2s"  # pre-1.0.2 unrestricted rule
 OPENVPN_BIN = "/usr/local/lib/openp2s/openvpn"
+OPENP2S_BIN = "/usr/local/bin/openp2s"
 # Each subcommand is granted separately with NO trailing arguments, so sudo
 # matches the command line exactly. Variable inputs travel over stdin or are
 # derived by the helper itself and are validated there.
@@ -393,6 +395,37 @@ def sudo_exists(path: str) -> bool:
     return subprocess.run(["sudo", "test", "-e", path], check=False).returncode == 0
 
 
+def install_openp2s_bundle(archive_path):
+    """Stage the portable bundle as the user, then install only runtime files."""
+    bundle_root = f"openp2s-{OPENP2S_VERSION}-linux-amd64"
+    destinations = (
+        ("openp2s", OPENP2S_BIN, "0755"),
+        ("openvpn-openp2s", OPENVPN_BIN, "0755"),
+        ("BUILDINFO", str(Path(OPENVPN_BIN).parent / "BUILDINFO"), "0644"),
+    )
+    with tempfile.TemporaryDirectory() as td:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for name, _, _ in destinations:
+                member = archive.getmember(f"{bundle_root}/{name}")
+                if not member.isfile():
+                    raise ValueError(f"Bundle member {name} is not a regular file")
+                # Do not extract archive paths, links or ownership onto the host.
+                with archive.extractfile(member) as source, (Path(td) / name).open("wb") as target:
+                    shutil.copyfileobj(source, target)
+        for directory in (Path(OPENP2S_BIN).parent, Path(OPENVPN_BIN).parent):
+            subprocess.run(["sudo", "install", "-d", "-m", "0755", "-o", "root", "-g", "root",
+                            str(directory)], check=True)
+        for name, destination, mode in destinations:
+            subprocess.run(["sudo", "install", "-m", mode, "-o", "root", "-g", "root",
+                            str(Path(td) / name), destination], check=True)
+
+
+def verify_openp2s_installation():
+    """Catch wrong paths, missing execute bits and loader errors before success."""
+    for binary in (OPENP2S_BIN, OPENVPN_BIN):
+        subprocess.run([binary, "--version"], check=True, capture_output=True, text=True, timeout=10)
+
+
 def cmd_setup():
     print("=== Azure VPN Plugin Setup & Hardening ===")
     
@@ -401,7 +434,7 @@ def cmd_setup():
         print("Please build openp2s from source: https://github.com/wyruweso/openp2s", file=sys.stderr)
         return 1
 
-    has_openp2s = bool(shutil.which("openp2s")) and Path(OPENVPN_BIN).exists()
+    has_openp2s = Path(OPENP2S_BIN).is_file() and Path(OPENVPN_BIN).is_file()
     if has_openp2s:
         print("✓ openp2s and patched openvpn binaries found.")
     else:
@@ -416,8 +449,18 @@ def cmd_setup():
                 print(f"Error: Checksum mismatch on openp2s download!\nExpected: {OPENP2S_SHA256}\nGot:      {digest}", file=sys.stderr)
                 return 1
             print("✓ Checksum verified.")
-            subprocess.run(["sudo", "tar", "-xzf", str(tmp_tar), "-C", "/usr/local", "--strip-components=1"], check=True)
-        print("✓ openp2s installed to /usr/local/bin/openp2s")
+            try:
+                install_openp2s_bundle(tmp_tar)
+            except (OSError, KeyError, ValueError, tarfile.TarError, subprocess.SubprocessError) as e:
+                print(f"Error: could not install OpenP2S bundle: {e}", file=sys.stderr)
+                return 1
+
+    try:
+        verify_openp2s_installation()
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"Error: OpenP2S installation is not usable: {e}", file=sys.stderr)
+        return 1
+    print(f"✓ OpenP2S and patched OpenVPN verified ({OPENP2S_BIN}, {OPENVPN_BIN}).")
 
     # Root-owned helper + exact-command sudoers rule
     user = getpass.getuser()
